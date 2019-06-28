@@ -37,6 +37,9 @@ class WFmerger(collections.abc.MutableMapping):
             for k2 in self.data[k1].keys():
                 yield k1+k2,self.data[k1][k2]
 
+    def __repr__(self):
+        return 'WFmerger: ' + self.data.__repr__()
+
     def keys(self):
         for k1 in ['wf1','wf2']:
             for k2 in self.data[k1].keys():
@@ -47,13 +50,9 @@ class WFmerger(collections.abc.MutableMapping):
 class MultiplyWF:
     """Multiplies two wave functions """
 
-    def __init__(self,nconfig,wf1,wf2):
+    def __init__(self,wf1,wf2):
         self.wf1=wf1
         self.wf2=wf2
-        #Using a ChainMap here since it makes things easy.
-        #But there is a possibility that names collide here. 
-        #one option is to use some name-mangling scheme for parameters
-        #within each wave function
         self.parameters=WFmerger(self.wf1.parameters,self.wf2.parameters)
 
         
@@ -97,29 +96,6 @@ class MultiplyWF:
 
 
 
-
-def test():
-    from pyscf import lib,gto,scf
-    from jastrow import Jastrow2B
-    from slater import PySCFSlaterRHF
-    nconf=10
-    
-    mol = gto.M(atom='Li 0. 0. 0.; H 0. 0. 1.5', basis='cc-pvtz',unit='bohr')
-    mf = scf.RHF(mol).run()
-    slater=PySCFSlaterRHF(nconf,mol,mf)
-    jastrow=Jastrow2B(nconf,mol)
-    jastrow.parameters['coeff']=np.random.random(jastrow.parameters['coeff'].shape)
-    configs=np.random.randn(nconf,4,3)
-    wf=MultiplyWF(nconf,slater,jastrow)
-    wf.parameters['wf2coeff']=np.ones(len(wf.parameters['wf2coeff']))
-    print(wf.wf2.parameters['coeff'])
-    
-    import testwf
-    for delta in [1e-3,1e-4,1e-5,1e-6,1e-7]:
-        print('delta', delta, "Testing gradient",testwf.test_wf_gradient(wf,configs,delta=delta))
-        print('delta', delta, "Testing laplacian", testwf.test_wf_laplacian(wf,configs,delta=delta))
-        print('delta', delta, "Testing pgradient", testwf.test_wf_pgradient(wf,configs,delta=delta))
-    
     
 
 def test_WFmerger():

@@ -4,43 +4,29 @@ import os
 os.environ["MKL_NUM_THREADS"] = "1" 
 os.environ["NUMEXPR_NUM_THREADS"] = "1" 
 os.environ["OMP_NUM_THREADS"] = "1" 
-
 import numpy as np
-from pyscf import lib, gto, scf
-from slater import PySCFSlaterRHF
-from accumulators import EnergyAccumulator
+    
+
+
 
 def initial_guess(mol,nconfig,r=1.0):
     """ Generate an initial guess by distributing electrons near atoms
-    proportional to their charge."""
-    nelec=np.sum(mol.nelec)
-    configs=np.zeros((nconfig,nelec,3))
-    wts=mol.atom_charges()
-    wts=wts/np.sum(wts)
+    proportional to their charge.
 
-    ### This is not ideal since we loop over configs 
-    ### Should figure out a way to throw configurations
-    ### more efficiently.
-    for c in range(nconfig):
-        count=0
-        for s in [0,1]:
-            neach=np.floor(mol.nelec[s]*wts)
-            nassigned=np.sum(neach)
-            nleft=mol.nelec[s]*wts-neach
-            tot=int(np.sum(nleft))
-            gets=np.random.choice(len(wts),p=nleft/tot,size=tot,replace=False) 
-            for i in gets:
-                neach[i]+=1
-            for n,coord in zip(neach,mol.atom_coords()):
-                for i in range(int(n)):
-                    configs[c,count,:]=coord+r*np.random.randn(3)
-                    count+=1
-    return configs
+    Args: 
+
+     mol: A PySCF-like molecule object. Should have atom_charges(), atom_coords(), and nelec
+
+     nconfig: How many configurations to generate.
+
+     r: How far from the atoms to distribute the electrons
+
+    Returns: 
+
+     A numpy array with shape (nconfig,nelectrons,3) with the electrons randomly distributed near 
+     the atoms.
     
-
-def initial_guess_vectorize(mol,nconfig,r=1.0):
-    """ Generate an initial guess by distributing electrons near atoms
-    proportional to their charge."""
+    """
     nelec=np.sum(mol.nelec)
     epos=np.zeros((nconfig,nelec,3))
     wts=mol.atom_charges()
@@ -55,88 +41,126 @@ def initial_guess_vectorize(mol,nconfig,r=1.0):
         nleft=mol.nelec[s]*wts-neach # fraction of electron unassigned on each atom
         nassigned=np.sum(neach) # number of electrons assigned
         totleft=int(mol.nelec[s]-nassigned) # number of electrons not yet assigned
-        bins=np.cumsum(nleft)/totleft
-        inds = np.argpartition(np.random.random((nconfig,len(wts))), totleft, axis=1)[:,:totleft]
-        ind0=s*mol.nelec[0]
-        epos[:,ind0:ind0+nassigned,:] = np.repeat(mol.atom_coords(),neach,axis=0)[np.newaxis] # assign core electrons
-        epos[:,ind0+nassigned:ind0+mol.nelec[s],:] = mol.atom_coords()[inds] # assign remaining electrons
+        if totleft > 0:
+            bins=np.cumsum(nleft)/totleft
+            inds = np.argpartition(np.random.random((nconfig,len(wts))), totleft, axis=1)[:,:totleft]
+            ind0=s*mol.nelec[0]
+            epos[:,ind0:ind0+nassigned,:] = np.repeat(mol.atom_coords(),neach,axis=0)[np.newaxis] # assign core electrons
+            epos[:,ind0+nassigned:ind0+mol.nelec[s],:] = mol.atom_coords()[inds] # assign remaining electrons
+    
     epos+=r*np.random.randn(*epos.shape) # random shifts from atom positions
+    
     return epos
 
 
 def limdrift(g,cutoff=1):
+    """
+    Limit a vector to have a maximum magnitude of cutoff while maintaining direction
+
+    Args:
+      g: a [nconf,ndim] vector
+      
+      cutoff: the maximum magnitude
+
+    Returns: 
+      The vector with the cut off applied.
+    """
     tot=np.linalg.norm(g,axis=1)
     mask=tot > cutoff
     g[mask,:]=g[mask,:]/tot[mask,np.newaxis]
     return g
     
 
-def vmc(mol,wf,coords,nsteps=10000,tstep=0.5,accumulators=None):
+def vmc(wf,coords,nsteps=100,tstep=0.5,accumulators=None,verbose=False,stepoffset=0):
+    """Run a Monte Carlo sample of a given wave function.
+
+    Args:
+      wf: A Wave function-like class. recompute(), gradient(), and updateinternals() are used, as well as 
+      anything (such as laplacian() ) used by accumulators
+      
+      coords: Initial electron coordinates
+
+      nsteps: Number of VMC steps to propagate
+
+      tstep: Time step for move proposals. Only affects efficiency.
+
+      accumulators: A dictionary of functor objects that take in (coords,wf) and return a dictionary of quantities to be averaged. np.mean(quantity,axis=0) should give the average over configurations. If None, then the coordinates will only be propagated with acceptance information.
+      
+      verbose: Print out step information 
+
+      stepoffset: If continuing a run, what to start the step numbering at.
+
+    Returns: (df,coords)
+       df: A list of dictionaries nstep long that contains all results from the accumulators. These are averaged across all walkers.
+
+       coords: The final coordinates from this calculation.
+       
+    """
     if accumulators is None:
-        accumulators={'energy':EnergyAccumulator(mol) } 
+        accumulators={}
+        if verbose:
+            print("WARNING: running VMC with no accumulators")
+            
+         
     nconf=coords.shape[0]
-    nelec=np.sum(mol.nelec)
+    nelec=coords.shape[1]
     df=[]
     wf.recompute(coords)
     for step in range(nsteps):
-        print("step",step)
+        if verbose:
+            print("step",step)
         acc=[]
         for e in range(nelec):
-
-            # Calculate gradient
+            #Propose move
             grad=limdrift(wf.gradient(e, coords[:,e,:]).T)
-
-            # Calculate new coordinates
             newcoorde=coords[:,e,:]+np.random.normal(scale=np.sqrt(tstep),size=(nconf,3))\
                       + grad*tstep
 
-            # Calculate new gradient
+            #Compute reverse move
             new_grad=limdrift(wf.gradient(e, newcoorde).T) 
-
-            # PDF for forward transition
             forward=np.sum((coords[:,e,:]+tstep*grad-newcoorde)**2,axis=1)
-
-            # PDF for backward transition
             backward=np.sum((newcoorde+tstep*new_grad-coords[:,e,:])**2,axis=1)
 
-            # Transition probability from distribution
+            #Acceptance
             t_prob = np.exp(1/(2*tstep)*(forward-backward))
-
-            # Compute transition probabilities and which moves to accept
             ratio=np.multiply(wf.testvalue(e,newcoorde)**2, t_prob)
             accept=ratio > np.random.rand(nconf)
             
-            # Original MC code
+            # Update wave function
             coords[accept,e,:]=newcoorde[accept,:]
             wf.updateinternals(e,coords[:,e,:],accept)
             acc.append(np.mean(accept))
         avg={}
         for k,accumulator in accumulators.items():
-            dat=accumulator(coords,wf)
+            dat=accumulator.avg(coords,wf)
             for m,res in dat.items():
-                avg[k+m]=np.mean(res,axis=0)
+                #print(m,res.nbytes/1024/1024)
+                avg[k+m]=res #np.mean(res,axis=0)
         avg['acceptance']=np.mean(acc)
+        avg['step']=stepoffset+step
+        avg['nconfig']=coords.shape[0]
         df.append(avg)
     return df, coords 
     
 
 def test():
+    from pyscf import lib, gto, scf
+    from pyqmc.slater import PySCFSlaterRHF
+    from pyqmc.accumulators import EnergyAccumulator
     import pandas as pd
     
     mol = gto.M(atom='Li 0. 0. 0.; Li 0. 0. 1.5', basis='cc-pvtz',unit='bohr',verbose=5)
     #mol = gto.M(atom='C 0. 0. 0.', ecp='bfd', basis='bfd_vtz')
     mf = scf.RHF(mol).run()
-    import pyscf2qwalk
-    pyscf2qwalk.print_qwalk(mol,mf)
+    #import pyscf2qwalk
+    #pyscf2qwalk.print_qwalk(mol,mf)
     nconf=5000
-    wf=PySCFSlaterRHF(nconf,mol,mf)
-    coords = initial_guess_vectorize(mol,nconf) 
-    def dipole(coords,wf):
-        return {'vec':np.sum(coords[:,:,:],axis=1) } 
+    wf=PySCFSlaterRHF(mol,mf)
+    coords = initial_guess(mol,nconf) 
 
     import time
     tstart=time.process_time()
-    df,coords=vmc(mol,wf,coords,nsteps=100,accumulators={'energy':EnergyAccumulator(mol), 'dipole':dipole } )
+    df,coords=vmc(wf,coords,nsteps=100,accumulators={'energy':EnergyAccumulator(mol) } )
     tend=time.process_time()
     print("VMC took",tend-tstart,"seconds")
 
@@ -144,7 +168,6 @@ def test():
     df.to_csv("data.csv")
     warmup=30
     print('mean field',mf.energy_tot(),'vmc estimation', np.mean(df['energytotal'][warmup:]),np.std(df['energytotal'][warmup:]))
-    print('dipole',np.mean(np.asarray(df['dipolevec'][warmup:]),axis=0))
     
     
 def test_compare_init_guess():
@@ -156,7 +179,7 @@ def test_compare_init_guess():
         mf = scf.RHF(mol).run()
         nconf=5000
         wf=PySCFSlaterRHF(nconf,mol,mf)
-        for i,func in enumerate([initial_guess_vectorize, initial_guess]):
+        for i,func in enumerate([initial_guess]):
             for j in range(5):
                 start = time.time()
                 configs = func(mol,nconf) 

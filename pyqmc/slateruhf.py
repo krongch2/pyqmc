@@ -1,7 +1,4 @@
 import numpy as np
-from pyscf import lib, gto, scf
-
-
 
 def sherman_morrison_row(e,inv,vec):
     ratio=np.einsum("ij,ij->i",vec,inv[:,:,e])
@@ -14,7 +11,7 @@ class PySCFSlaterUHF:
     """A wave function object has a state defined by a reference configuration of electrons.
     The functions recompute() and updateinternals() change the state of the object, and 
     the rest compute and return values from that state. """
-    def __init__(self,nconfig,mol,mf):
+    def __init__(self,mol,mf):
         self.occ=np.asarray(mf.mo_occ > 0.9)
         self.parameters={}
 
@@ -27,13 +24,8 @@ class PySCFSlaterUHF:
           self.parameters['mo_coeff_beta'] =mf.mo_coeff[:,np.asarray(mf.mo_occ > 1.1)]
 
         self._coefflookup=('mo_coeff_alpha','mo_coeff_beta')
-        self._nconfig=nconfig
         self._mol=mol
         self._nelec=mol.nelec
-        #self._inverse=(np.zeros((nconfig,self._nelec[0],self._nelec[0])),
-        #           np.zeros((nconfig,self._nelec[1],self._nelec[1])))
-        #self._dets=( (np.zeros(nconfig),np.zeros(nconfig)),
-        #            (np.zeros(nconfig),np.zeros(nconfig)))
         
             
     def recompute(self,configs):
@@ -41,6 +33,8 @@ class PySCFSlaterUHF:
         (phase,logdet). If the wf is real, phase will be +/- 1."""
         mycoords=configs.reshape((configs.shape[0]*configs.shape[1],configs.shape[2]))
         ao = self._mol.eval_gto('GTOval_sph', mycoords).reshape((configs.shape[0],configs.shape[1],-1))
+        
+        self._aovals = ao
         self._dets=[]
         self._inverse=[]
         for s in [0,1]:
@@ -48,6 +42,7 @@ class PySCFSlaterUHF:
                 mo=ao[:,0:self._nelec[0],:].dot(self.parameters[self._coefflookup[s]])
             else:
                 mo=ao[:,self._nelec[0]:self._nelec[0]+self._nelec[1],:].dot(self.parameters[self._coefflookup[s]])
+            #This could be done faster; we are doubling our effort here.
             self._dets.append(np.linalg.slogdet(mo))
             self._inverse.append(np.linalg.inv(mo))
             
@@ -85,7 +80,7 @@ class PySCFSlaterUHF:
         
     def _testcol(self,i,s,vec):
         """vec is a nconfig,nmo vector which replaces column i"""
-        ratio=np.einsum("ij,ij->i",vec,self._inverse[:,s,i,:]) #need to test this!
+        ratio=np.einsum("ij,ij->i",vec,self._inverse[s][:,i,:])
         return ratio
     
     def gradient(self,e,epos):
@@ -121,21 +116,34 @@ class PySCFSlaterUHF:
         which correspond to the parameter dictionary.
         """
         d={}
-#        ao = self._mol.eval_gto('GTOval_sph', mycoords)
-        
-        #use testcol() to update determinant values for each mo_coeff
+       
+        for parm in self.parameters:
+          s = 0 
+          if("beta" in parm): s = 1
+          #Get AOs for our spin channel only
+          ao = self._aovals[:,s*self._nelec[0]:self._nelec[s] + s*self._nelec[0],:] #(config, electron, ao)
+
+          pgrad_shape = (ao.shape[0],)+self.parameters[parm].shape
+          pgrad = np.zeros(pgrad_shape)
+          #Compute derivatives w.r.t MO coefficients
+          for i in range(self._nelec[s]):     #MO loop
+            for j in range(ao.shape[2]): #AO loop
+              vec = ao[:,:,j]
+              pgrad[:,j,i] = self._testcol(i,s,vec) #nconfig
+          d[parm]=np.array(pgrad) #Returns config, coeff
         return d
         
-        
 def test():  
+    from pyscf import lib, gto, scf
+    import pyqmc.testwf as testwf
+    
     mol = gto.M(atom='Li 0. 0. 0.; H 0. 0. 1.5', basis='cc-pvtz',unit='bohr', spin=0)
     for mf in [scf.RHF(mol).run(), scf.ROHF(mol).run(), scf.UHF(mol).run()]:
         print('')
         nconf=10
         nelec=np.sum(mol.nelec)
-        slater=PySCFSlaterUHF(nconf,mol,mf)
+        slater=PySCFSlaterUHF(mol,mf)
         configs=np.random.randn(nconf,nelec,3)
-        import testwf
         print("testing internals:", testwf.test_updateinternals(slater,configs))
         for delta in [1e-3,1e-4,1e-5,1e-6,1e-7]:
             print('delta', delta, "Testing gradient",testwf.test_wf_gradient(slater,configs,delta=delta))
